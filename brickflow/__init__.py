@@ -285,7 +285,6 @@ from brickflow.engine.task import (
     MavenTaskLibrary,
     CranTaskLibrary,
     EmailNotifications,
-    WebhookNotifications,
     TaskNotificationSettings,
     DLTPipeline,
     DLTEdition,
@@ -336,7 +335,6 @@ __all__: List[str] = [
     "MavenTaskLibrary",
     "CranTaskLibrary",
     "EmailNotifications",
-    "WebhookNotifications",
     "DLTPipeline",
     "NotebookTask",
     "SparkJarTask",
@@ -365,3 +363,4 @@ __all__: List[str] = [
 # auto path resolver
 
 get_relative_path_to_brickflow_root()
+

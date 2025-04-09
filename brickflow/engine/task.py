@@ -278,24 +278,7 @@ class EmailNotifications:
             "on_failure": self.on_failure,
             "on_success": self.on_success,
         }
-    
-@dataclass(frozen=True)    
-class WebhookNotifications:
-    on_failure: Optional[List[JobsWebhookNotificationsOnFailure]] = None
-    on_start: Optional[List[JobsWebhookNotificationsOnStart]] = None
-    on_success: Optional[List[JobsWebhookNotificationsOnSuccess]] = None
-    on_streaming_backlog_exceeded: Optional[List[JobsWebhookNotificationsOnStreamingBacklogExceeded]] = None
-    on_duration_warning_threshold_exceeded: Optional[List[JobsWebhookNotificationsOnDurationWarningThresholdExceeded]] = None
 
-
-    def to_tf_dict(self) -> Dict[str, Optional[List[JobsWebhookNotificationsOnFailure|JobsWebhookNotificationsOnStart|JobsWebhookNotificationsOnSuccess|JobsWebhookNotificationsOnStreamingBacklogExceeded|JobsWebhookNotificationsOnDurationWarningThresholdExceeded]]]:
-        return {
-            "on_start": self.on_start,
-            "on_failure": self.on_failure,
-            "on_success": self.on_success,
-            "on_streaming_backlog_exceeded": self.on_streaming_backlog_exceeded,
-            "on_duration_warning_threshold_exceeded": self.on_duration_warning_threshold_exceeded,
-        }
 
 class TaskNotificationSettings(JobsTasksNotificationSettings):
     pass
@@ -304,7 +287,6 @@ class TaskNotificationSettings(JobsTasksNotificationSettings):
 @dataclass(frozen=True)
 class TaskSettings:
     email_notifications: Optional[EmailNotifications] = None
-    webhook_notifications: Optional[WebhookNotifications] = None
     notification_settings: Optional[TaskNotificationSettings] = None
     timeout_seconds: Optional[int] = None
     max_retries: Optional[int] = None
@@ -319,7 +301,6 @@ class TaskSettings:
             return self
         return TaskSettings(
             other.email_notifications or self.email_notifications,
-            other.webhook_notifications or self.webhook_notifications,
             other.notification_settings or self.notification_settings,
             other.timeout_seconds or self.timeout_seconds or 0,
             other.max_retries or self.max_retries,
@@ -329,9 +310,7 @@ class TaskSettings:
             other.webhook_notifications or self.webhook_notifications,
         )
 
-    def to_tf_dict(
-        self,
-    ) -> Dict[
+    def to_tf_dict(self, task_type: TaskType = TaskType.BRICKFLOW_TASK) -> Dict[
         str,
         Optional[str]
         | Optional[int]
@@ -351,7 +330,7 @@ class TaskSettings:
             if self.notification_settings is None
             else {"notification_settings": self.notification_settings.dict()}
         )
-        return {
+        task_settings = {
             **notification_settings,
             "email_notifications": email_not,
             "webhook_notifications": webhook_not,
@@ -361,6 +340,12 @@ class TaskSettings:
             "retry_on_timeout": self.retry_on_timeout,
             **({"run_if": self.run_if.value} if self.run_if else {}),
         }
+        if task_type in [TaskType.IF_ELSE_CONDITION_TASK, TaskType.FOR_EACH_TASK]:
+            # Setting timeout seconds or max_retires if/else and for-each task will cause deployment to fail
+            task_settings.pop("timeout_seconds", None)
+            task_settings.pop("max_retries", None)
+
+        return task_settings
 
 
 @dataclass
@@ -524,10 +509,31 @@ class SparkPythonTask(JobsTasksSparkPythonTask):
         self.python_file = kwargs.get("python_file", None)
 
 
+def validate_for_each_task_type(value: TaskType) -> TaskType:
+    """For each task does not support all task types"""
+    supported_task_types = (
+        TaskType.NOTEBOOK_TASK,
+        TaskType.SPARK_JAR_TASK,
+        TaskType.SPARK_PYTHON_TASK,
+        TaskType.RUN_JOB_TASK,
+        TaskType.SQL,
+        TaskType.BRICKFLOW_TASK,  # Accounts for brickflow entrypoint tasks
+    )
+    if value not in supported_task_types:
+        raise ValueError(
+            f"Unsupported nested task type: only {','.join(task_type.name for task_type in supported_task_types)} "
+            f"are allowed"
+        )
+    return value
+
+
 class JobsTasksForEachTaskConfigs(BaseModel):
     inputs: str = Field(..., description="The input data for the task.")
     concurrency: int = Field(
         default=1, description="Number of iterations that can run in parallel,"
+    )
+    task_type: Optional[TaskType] = Field(
+        default=None, description="The type of the nested task"
     )
 
     @field_validator("inputs", mode="before")
@@ -536,6 +542,14 @@ class JobsTasksForEachTaskConfigs(BaseModel):
         if not isinstance(inputs, str):
             inputs = json.dumps(inputs)
         return inputs
+
+    @field_validator("task_type", mode="before")
+    @classmethod
+    def validate_task_type(cls, value: Optional[TaskType]) -> Optional[TaskType]:
+        """Task type can also be None (for backward compatibility), will validate only if provided"""
+        if value:
+            return validate_for_each_task_type(value)
+        return value
 
 
 class ForEachTask(JobsTasksForEachTask):
@@ -1269,3 +1283,4 @@ def get_brickflow_libraries(enable_plugins: bool = False) -> List[TaskLibrary]:
         ]
     else:
         return [bf_lib]
+
