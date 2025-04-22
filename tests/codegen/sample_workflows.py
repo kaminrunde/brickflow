@@ -19,6 +19,7 @@ from brickflow.engine.task import (
     IfElseConditionTask,
     JobsTasksForEachTaskConfigs,
     NotebookTask,
+    PythonWheelTask,
     RunJobTask,
     SparkJarTask,
     SparkPythonTask,
@@ -78,6 +79,18 @@ def notebook_task_a(*, test="var"):
     return NotebookTask(
         notebook_path="notebooks/notebook_a",
     )  # type: ignore
+
+
+@wf.python_wheel_task(
+    libraries=[PypiTaskLibrary("data-mirror")],
+    depends_on=notebook_task_a,
+)
+def my_python_wheel_task():
+    return PythonWheelTask(
+        package_name="data-mirror",
+        entry_point="datamirror",
+        parameters=["--configuration_file", "dbfs:/path/to/config.json"],
+    )
 
 
 @wf.spark_jar_task(
@@ -339,6 +352,13 @@ class BadPythonModel(BaseModel):
     parameters: List[str]
 
 
+class BadPythonWheelModel(BaseModel):
+    package_name: str
+    entry_point: str
+    named_parameters: Optional[Dict[str, str]] = None
+    parameters: Optional[List[str]] = None
+
+
 class BadSparkJar(BaseModel):
     jar_uri: str
     main_class_name: str
@@ -384,6 +404,15 @@ class BadDLT(BaseModel):
     warehouse_id: Optional[str]
 
 
+@wf_bad_tasks.task(task_type=TaskType.PYTHON_WHEEL_TASK)
+def task_python_wheel():
+    return BadPythonWheelModel(
+        package_name="data-mirror",
+        entry_point="datamirror",
+        parameters=["--configuration_file", "dbfs:/path/to/config.json"],
+    )
+
+
 @wf_bad_tasks.task(task_type=TaskType.SPARK_PYTHON_TASK)
 def task_python():
     return BadPythonModel(
@@ -424,8 +453,7 @@ def first_notebook():
 @wf3.for_each_task(
     depends_on=first_notebook,
     for_each_task_conf=JobsTasksForEachTaskConfigs(
-        concurrency=3,
-        inputs="[1, 2, 3]",
+        concurrency=3, inputs="[1, 2, 3]", task_type=TaskType.NOTEBOOK_TASK
     ),
 )
 def for_each_notebook():
@@ -439,12 +467,14 @@ def for_each_notebook():
 @wf3.for_each_task(
     depends_on=first_notebook,
     for_each_task_conf=JobsTasksForEachTaskConfigs(
-        inputs=["1", "2", "3"],
-        concurrency=1,
+        inputs=["1", "2", "3"], concurrency=1, task_type=TaskType.BRICKFLOW_TASK
     ),
 )
 def for_each_bf_task(*, looped_parameter="{{input}}"):
     print(f"This is a nested bf task running with input: {looped_parameter}")
+    raise ValueError(
+        "This should not be raised during codegen if we provide the task_type!"
+    )
 
 
 @wf3.for_each_task(

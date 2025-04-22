@@ -376,6 +376,58 @@ The Python file to be executed. Cloud file URIs (such as dbfs:/, s3:/, adls:/, g
 &emsp;<b>source</b>: When set to `WORKSPACE` or not specified, the file will be retrieved from the local Databricks workspace or cloud location (if the `python_file` has a URI format). When set to `GIT`,\nthe Python file will be retrieved from a Git repository defined in `git_source`.\n\n* `WORKSPACE`: The Python file is located in a Databricks workspace or at a cloud filesystem URI.\n* `GIT`: The Python file is located in a remote Git repository..<br />
 &emsp;<b>parameters [Optional]</b>: Parameters passed to the main method.
 
+#### Python Wheel Task
+
+The `Python Wheel Task` is used as a decorator in conjunction with the `python_wheel_task` method of a `Workflow` instance. This method registers the task within the workflow.
+
+Here's an example of how to use the `Python Wheel` Task type:
+
+```python
+from brickflow import Workflow, PythonWheelTask, PypiTaskLibrary
+
+wf = Workflow(...)
+
+@wf.python_wheel_task(
+    libraries=[
+        PypiTaskLibrary(
+            package="some-package"
+        )
+    ]
+)
+def python_wheel_task_a():
+    return PythonWheelTask(
+        package_name="example_package",
+        entry_point="main_function",
+        parameters=["--param1", "value1", "--param2", "value2"],
+    )
+
+# Alternatively, you can pass the task type as a parameter
+@wf.task(
+    task_type=TaskType.PYTHON_WHEEL_TASK,
+    libraries=[
+        PypiTaskLibrary(
+            package="some-package"
+        )
+    ]
+)
+def python_wheel_task_b():
+    return PythonWheelTask(
+        package_name="example_package",
+        entry_point="main_function",
+        parameters=["--param1", "value1", "--param2", "value2"],
+    )
+```
+
+`PythonWheelTask` class can accept the following as inputs:
+
+&emsp;<b>package_name</b>: The name of the Python package containing the wheel.<br>
+&emsp;<b>entry_point</b>: The entry point function to execute within the package.<br>
+&emsp;<b>named_parameters[Optional]</b>: A dict of parameters to pass to the entry point function. Leave empty if `parameters` is used. <br>
+&emsp;<b>parameters[Optional]</b>: A list of parameters to pass to the entry point function. Leave empty if `named_parameters` is used.
+
+This task type is useful for running Python code packaged as a wheel file, allowing for modular and reusable workflows.
+
+
 #### SQL Task
 
 The SqlTask class is used to create SQL tasks in the workflow. It can be used to create tasks with a query ID, file path, alert ID, and dashboard ID.<br>
@@ -520,6 +572,7 @@ The `for_each_task` decorator can be configured by providing in the `for_each_ta
 
 - **inputs: Optional[str]**: the list of input values to iterate over. This can be a python iterable, or a string representing a JSON formatted array of values.
 - **for_each_task_concurrency: Optional[int]**: the number of concurrent executions of the task. Default is 1.
+- **task_type: Optional[TaskType]**: the type of task to iterate over. While this is not required, for nested brickflow type tasks it's recommended to set it accordingly otherwise the task could be unintentionally run during deployment. This attribute will likely be mandatory in a future minor release. 
 
 A reference to the current input value we are iterating on can be accessed using `{{input}}` databricks workflow parameter.
 
@@ -549,7 +602,7 @@ def example_notebook():
 @wf.for_each_task(
     depends_on=example_task,
     for_each_task_conf=JobsTasksForEachTaskConfigs(
-        inputs='["1", "2", "3"]', concurrency=3
+        inputs='["1", "2", "3"]', concurrency=3, task_type=TaskType.BRICKFLOW_TASK
     ),
 )
 def example_brickflow_task(*, test_param="{{input}}"):

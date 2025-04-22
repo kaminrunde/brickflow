@@ -11,6 +11,7 @@ from brickflow import (
     IfElseConditionTask,
     SparkJarTask,
     SparkPythonTask,
+    PythonWheelTask,
 )
 from brickflow.bundles.model import (
     JobsTasks,
@@ -41,6 +42,7 @@ from brickflow.engine.task import (
     get_brickflow_libraries,
     get_brickflow_tasks_hook,
     get_plugin_manager,
+    TaskType,
 )
 from brickflow.engine.utils import get_job_id
 from tests.engine.sample_workflow import (
@@ -588,6 +590,25 @@ class TestTask:
         assert task.source is None
         assert task.parameters is None
 
+    def test_init_python_wheel(self):
+        task = PythonWheelTask(
+            package_name="test_package",
+            entry_point="test_entry_point",
+            parameters=["--param1", "test"],
+        )
+        assert task.package_name == "test_package"
+        assert task.entry_point == "test_entry_point"
+        assert task.parameters == ["--param1", "test"]
+
+    def test_without_params_python_wheel(self):
+        task = PythonWheelTask(
+            package_name="test_package",
+            entry_point="test_entry_point",
+        )
+        assert task.package_name == "test_package"
+        assert task.entry_point == "test_entry_point"
+        assert task.parameters is None
+
     def if_else_condition_task(self):
         # Test the __init__ method
         instance = IfElseConditionTask(left="left_value", right="right_value", op="==")
@@ -674,3 +695,63 @@ class TestTask:
         )
 
         assert for_each_task.inputs == '["input1", "input2"]'
+
+    @pytest.mark.parametrize(
+        "task_type", [(TaskType.IF_ELSE_CONDITION_TASK,), (TaskType.FOR_EACH_TASK,)]
+    )
+    def task_settings_filtered_out(self, task_type):
+        """timeout settings and retry settings should be filtered out for if/else and for-each tasks"""
+        task_settings = TaskSettings(
+            timeout_seconds=30,
+            max_retries=3,
+            min_retry_interval_millis=1000,
+            retry_on_timeout=True,
+        )
+
+        actual = task_settings.to_tf_dict(task_type)
+        assert "timeout_seconds" not in actual
+        assert "max_retries" not in actual
+
+    def task_settings_not_filtered(self):
+        task_settings = TaskSettings(
+            timeout_seconds=30,
+            max_retries=3,
+            min_retry_interval_millis=1000,
+            retry_on_timeout=True,
+        )
+
+        actual = task_settings.to_tf_dict()
+        assert "timeout_seconds" in actual
+        assert "max_retries" in actual
+
+    def test_for_each_task_validation_task_type(self):
+        # Valid task type
+        for_each_task = ForEachTask(
+            configs=JobsTasksForEachTaskConfigs(
+                inputs=["input1", "input2"],
+                concurrency=2,
+                task_type=TaskType.NOTEBOOK_TASK,
+            ),
+            task=JobsTasks(task_key="task_key"),
+        )
+        assert for_each_task.configs.task_type == TaskType.NOTEBOOK_TASK
+
+        # Not providing a task type should set task type to None
+        for_each_task = ForEachTask(
+            configs=JobsTasksForEachTaskConfigs(
+                inputs=["input1", "input2"], concurrency=2
+            ),
+            task=JobsTasks(task_key="task_key"),
+        )
+        assert for_each_task.configs.task_type is None
+
+        # Setting a task type with a value other than the valid ones should raise a ValueError
+        with pytest.raises(ValueError):
+            ForEachTask(
+                configs=JobsTasksForEachTaskConfigs(
+                    inputs=["input1", "input2"],
+                    concurrency=2,
+                    task_type=TaskType.IF_ELSE_CONDITION_TASK,
+                ),
+                task=JobsTasks(task_key="task_key"),
+            )

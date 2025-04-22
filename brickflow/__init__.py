@@ -296,6 +296,7 @@ from brickflow.engine.task import (
     SqlTask,
     IfElseConditionTask,
     DbtTask,
+    PythonWheelTask,
 )
 from brickflow.engine.compute import Cluster, Runtimes
 from brickflow.engine.project import Project
@@ -337,6 +338,7 @@ __all__: List[str] = [
     "EmailNotifications",
     "DLTPipeline",
     "NotebookTask",
+    "PythonWheelTask",
     "SparkJarTask",
     "SparkPythonTask",
     "RunJobTask",
