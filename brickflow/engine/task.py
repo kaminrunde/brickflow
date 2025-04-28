@@ -561,6 +561,7 @@ def validate_for_each_task_type(value: TaskType) -> TaskType:
         TaskType.RUN_JOB_TASK,
         TaskType.SQL,
         TaskType.BRICKFLOW_TASK,  # Accounts for brickflow entrypoint tasks
+        TaskType.DBT_TASK,
     )
     if value not in supported_task_types:
         raise ValueError(
