@@ -1,6 +1,7 @@
 import abc
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
@@ -150,9 +151,24 @@ class Workflow:
     parameters: Optional[List[JobsParameters]] = None
     # environments should be defined for serverless workloads
     environments: Optional[List[JobsEnvironments]] = None
+    # enabled by databricks asset bundles by default if set to None
+    # Look at https://github.com/databricks/cli/pull/1385
+    queue: Optional[bool] = None
 
     def __post_init__(self) -> None:
         self.graph.add_node(ROOT_NODE)
+
+        # Set schedule_pause_status to PAUSED by default for non-prod environments
+        env = os.getenv(BrickflowEnvVars.BRICKFLOW_ENV.value, "local").lower()
+        envs_to_pause = ["local", "dev", "test"]
+
+        if env in envs_to_pause and self.schedule_pause_status == "UNPAUSED":
+            logging.info(
+                "Setting schedule_pause_status to PAUSED as default for %s environment",
+                env,
+            )
+            self.schedule_pause_status = "PAUSED"
+
         if self.default_cluster is None and self.clusters == []:
             logging.info(
                 "Default cluster details are not provided, switching to serverless compute."
@@ -415,7 +431,7 @@ class Workflow:
         # enforce notebook type execution and replacing the original callable function with the RunJobInRemoteWorkspace
         if task_type == TaskType.RUN_JOB_TASK:
             func = f()
-            if func.host:
+            if hasattr(func, "host") and func.host:
                 from brickflow_plugins.databricks.run_job import RunJobInRemoteWorkspace
 
                 task_type = TaskType.BRICKFLOW_TASK
