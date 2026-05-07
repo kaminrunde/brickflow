@@ -1,17 +1,18 @@
+import re
 from datetime import timedelta
 
 import pytest
 from requests_mock.mocker import Mocker as RequestsMocker
 
 from brickflow_plugins.databricks.workflow_dependency_sensor import (
-    WorkflowTaskDependencySensor,
     WorkflowDependencySensorTimeOutException,
+    WorkflowTaskDependencySensor,
 )
 
 
 class TestWorkflowTaskDependencySensor:
     workspace_url = "https://42.cloud.databricks.com"
-    endpoint_url = f"{workspace_url}/api/2.1/jobs/runs/list"
+    endpoint_url = f"{workspace_url}/api/.*/jobs/runs/list"
     response = {
         "runs": [
             {
@@ -41,6 +42,13 @@ class TestWorkflowTaskDependencySensor:
                         "task_key": "baz",
                         "state": {},
                     },
+                    {
+                        "run_id": 400,
+                        "task_key": "skipped_task",
+                        "state": {
+                            "result_state": "EXCLUDED",
+                        },
+                    },
                 ],
             }
         ]
@@ -64,7 +72,7 @@ class TestWorkflowTaskDependencySensor:
     @pytest.fixture(autouse=True, name="api")
     def mock_api(self):
         rm = RequestsMocker()
-        rm.get(self.endpoint_url, json=self.response, status_code=int(200))
+        rm.get(re.compile(self.endpoint_url), json=self.response, status_code=int(200))
         yield rm
 
     def test_sensor_success(self, caplog, api):
@@ -126,4 +134,101 @@ class TestWorkflowTaskDependencySensor:
                 "Found the run_id '1' and 'baz' but the task has not started yet..."
                 in caplog.messages
             )
+            assert "Didn't find a successful task run yet..." in caplog.messages
+
+    def test_sensor_allow_skipped_true(self, caplog, api):
+        with api:
+            sensor = WorkflowTaskDependencySensor(
+                databricks_host=self.workspace_url,
+                databricks_token="token",
+                dependency_job_name="job",
+                dependency_task_name="skipped_task",
+                delta=timedelta(seconds=1),
+                timeout_seconds=1,
+                poke_interval_seconds=1,
+                allow_skipped=True,
+            )
+
+            sensor.execute()
+
+            assert (
+                "Found the run_id '1' and 'skipped_task' task with state: EXCLUDED"
+                in caplog.text
+            )
+            assert "Found a skipped task in run: 1" in caplog.text
+
+    def test_sensor_allow_skipped_true_with_success_task(self, caplog, api):
+        with api:
+            sensor = WorkflowTaskDependencySensor(
+                databricks_host=self.workspace_url,
+                databricks_token="token",
+                dependency_job_name="job",
+                dependency_task_name="foo",
+                delta=timedelta(seconds=1),
+                timeout_seconds=1,
+                poke_interval_seconds=1,
+                allow_skipped=True,
+            )
+
+            sensor.execute()
+
+            assert (
+                "Found the run_id '1' and 'foo' task with state: SUCCESS" in caplog.text
+            )
+            assert "Found a successful run: 1" in caplog.text
+
+    def test_sensor_allow_skipped_false_excluded_task(self, caplog, api):
+        with api:
+            sensor = WorkflowTaskDependencySensor(
+                databricks_host=self.workspace_url,
+                databricks_token="token",
+                dependency_job_name="job",
+                dependency_task_name="skipped_task",
+                delta=timedelta(seconds=1),
+                timeout_seconds=1,
+                poke_interval_seconds=1,
+                allow_skipped=False,
+            )
+
+            with pytest.raises(WorkflowDependencySensorTimeOutException):
+                sensor.execute()
+
+            assert (
+                "Found the run_id '1' and 'skipped_task' task with state: EXCLUDED"
+                in caplog.messages
+            )
+            assert "Didn't find a successful task run yet..." in caplog.messages
+
+    def test_sensor_allow_skipped_default_is_false(self, caplog, api):
+        with api:
+            sensor = WorkflowTaskDependencySensor(
+                databricks_host=self.workspace_url,
+                databricks_token="token",
+                dependency_job_name="job",
+                dependency_task_name="skipped_task",
+                delta=timedelta(seconds=1),
+                timeout_seconds=1,
+                poke_interval_seconds=1,
+            )
+
+            with pytest.raises(WorkflowDependencySensorTimeOutException):
+                sensor.execute()
+
+            assert "Didn't find a successful task run yet..." in caplog.messages
+
+    def test_sensor_task_not_found(self, caplog, api):
+        with api:
+            sensor = WorkflowTaskDependencySensor(
+                databricks_host=self.workspace_url,
+                databricks_token="token",
+                dependency_job_name="job",
+                dependency_task_name="nonexistent_task",
+                delta=timedelta(seconds=1),
+                timeout_seconds=1,
+                poke_interval_seconds=1,
+            )
+
+            with pytest.raises(WorkflowDependencySensorTimeOutException):
+                sensor.execute()
+
             assert "Didn't find a successful task run yet..." in caplog.messages

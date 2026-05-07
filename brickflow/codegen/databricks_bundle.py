@@ -51,8 +51,11 @@ from brickflow.bundles.model import (
     PipelinesLibraries,
     PipelinesLibrariesNotebook,
     Resources,
+    Sync,
     Targets,
     Workspace,
+    JobsQueue,
+    JobsHealth,
 )
 from brickflow.cli.projects import MultiProjectManager, get_brickflow_root
 from brickflow.codegen import (
@@ -427,10 +430,14 @@ class DatabricksBundleCodegen(CodegenInterface):
     ) -> None:
         super().__init__(project, id_, env, **_kwargs)
         self.imports: List[ImportBlock] = []
-        self.mutators = mutators or [
-            DatabricksBundleTagsAndNameMutator(),
-            DatabricksBundleImportMutator(),
-        ]
+        self.mutators = (
+            mutators
+            if mutators is not None
+            else [
+                DatabricksBundleTagsAndNameMutator(),
+                DatabricksBundleImportMutator(),
+            ]
+        )
 
     def add_import(self, import_: ImportBlock) -> None:
         self.imports.append(import_)
@@ -543,20 +550,40 @@ class DatabricksBundleCodegen(CodegenInterface):
         depends_on: List[JobsTasksDependsOn],
         **_kwargs: Any,
     ) -> JobsTasks:
-        notebook_task: JobsTasksNotebookTask = task.task_func()
+        notebook_task: JobsTasksNotebookTask
 
-        try:
-            assert isinstance(notebook_task, JobsTasksNotebookTask)
-        except AssertionError as e:
-            raise ValueError(
-                f"Error while building notebook task {task_name}. "
-                f"Make sure {task_name} returns a NotebookTask object."
-            ) from e
+        # Handle injected notebooks (generated from templates)
+        if task.injected_notebook_path:
+            _ilog.info(
+                "Building injected notebook task '%s' from path: %s",
+                task_name,
+                task.injected_notebook_path,
+            )
 
-        # Setting common task parameters if present
+            # Remove .py extension for notebook path - Databricks stores notebooks without extension
+            notebook_path = task.injected_notebook_path
+            if notebook_path.endswith(".py"):
+                notebook_path = notebook_path[:-3]
+
+            # Create notebook task using DAB workspace.file_path variable
+            notebook_task = JobsTasksNotebookTask(
+                notebook_path=f"${{workspace.file_path}}/{notebook_path}",
+                source="WORKSPACE",
+            )
+        else:
+            # Handle user-defined notebook tasks (existing behavior)
+            notebook_task = task.task_func()
+
+            try:
+                assert isinstance(notebook_task, JobsTasksNotebookTask)
+            except AssertionError as e:
+                raise ValueError(
+                    f"Error while building notebook task {task_name}. "
+                    f"Make sure {task_name} returns a NotebookTask object."
+                ) from e
+
         workflow: Optional[Workflow] = _kwargs.get("workflow")
         common_task_parameters = workflow.common_task_parameters if workflow else None
-
         if common_task_parameters:
             notebook_task.base_parameters = notebook_task.base_parameters or {}
             for k, v in common_task_parameters.items():
@@ -733,19 +760,34 @@ class DatabricksBundleCodegen(CodegenInterface):
         depends_on: List[JobsTasksDependsOn],
         **_kwargs: Any,
     ) -> JobsTasks:
-        run_job_task: JobsTasksRunJobTask = task.task_func()
+        run_job_task: Union[JobsTasksRunJobTask, Workflow] = task.task_func()
 
         try:
-            assert isinstance(run_job_task, JobsTasksRunJobTask)
+            assert isinstance(run_job_task, (JobsTasksRunJobTask, Workflow))
         except AssertionError as e:
             raise ValueError(
                 f"Error while building run job task {task_name}. "
-                f"Make sure {task_name} returns a RunJobTask object."
+                f"Make sure {task_name} returns a RunJobTask or Workflow object."
             ) from e
+
+        job_id = None
+
+        if isinstance(run_job_task, JobsTasksRunJobTask):
+            job_id = run_job_task.job_id
+        elif isinstance(run_job_task, Workflow):
+            # If the task is a workflow, we need to set the job_id and job_name
+            # based on the workflow name. The job_id will be used in the JobsTasks.
+            # Uncomment the following lines if you want to handle workflow references
+            # in a specific way (e.g., using a custom naming convention).
+            if self.project.workflow_exists(run_job_task) is False:
+                raise ValueError(
+                    f"Workflow {run_job_task.name} does not exist in the current project."
+                )
+            job_id = f"${{resources.jobs.{run_job_task.name}.id}}"
 
         return JobsTasks(
             **task_settings.to_tf_dict(),  # type: ignore
-            run_job_task=JobsTasksRunJobTask(job_id=run_job_task.job_id, job_parameters=run_job_task.job_parameters),
+            run_job_task=JobsTasksRunJobTask(job_id=job_id),
             depends_on=depends_on,
             task_key=task_name,
         )
@@ -996,7 +1038,11 @@ class DatabricksBundleCodegen(CodegenInterface):
         tasks = []
 
         for task_name, task in workflow.tasks.items():
-            build_func = self._get_task_builder(task_type=task.task_type)
+            # Route injected notebooks to notebook builder
+            if task.injected_notebook_path:
+                build_func = self._get_task_builder(task_type=TaskType.NOTEBOOK_TASK)
+            else:
+                build_func = self._get_task_builder(task_type=task.task_type)
             tasks.append(
                 self._build_task(
                     build_func=build_func,
@@ -1090,9 +1136,10 @@ class DatabricksBundleCodegen(CodegenInterface):
             tasks = self.workflow_obj_to_tasks(workflow)
             job = Jobs(
                 name=workflow_name,
+                description=workflow.description,
                 tasks=tasks,
                 tags=workflow.tags,
-                health=workflow.health,
+                health=JobsHealth(rules=workflow.health) if workflow.health else None,
                 job_clusters=[JobsJobClusters(**c) for c in workflow_clusters],
                 schedule=self.workflow_obj_to_schedule(workflow),
                 max_concurrent_runs=workflow.max_concurrent_runs,
@@ -1109,6 +1156,11 @@ class DatabricksBundleCodegen(CodegenInterface):
                 parameters=workflow.parameters,
                 environments=workflow.environments,
                 git_source=git_conf,
+                queue=(
+                    JobsQueue(enabled=workflow.queue)
+                    if workflow.queue is not None
+                    else None
+                ),
             )
 
             jobs[workflow_name] = job
@@ -1153,6 +1205,17 @@ class DatabricksBundleCodegen(CodegenInterface):
         if bundle_suffix is not None:
             bundle_root_path = bundle_root_path / bundle_suffix
 
+        has_injected_notebooks = any(
+            task.injected_notebook_path
+            for workflow in self.project.workflows.values()
+            for task in workflow.tasks.values()
+        )
+        sync = (
+            Sync(include=["_brickflow_injected_notebooks/**"])
+            if has_injected_notebooks
+            else None
+        )
+
         env_content = Targets(
             workspace=Workspace(
                 root_path=str(bundle_root_path.as_posix()),
@@ -1160,6 +1223,7 @@ class DatabricksBundleCodegen(CodegenInterface):
                 state_path=str((bundle_root_path / "state").as_posix()),
             ),
             resources=resources,
+            sync=sync,
         )
 
         return DatabricksAssetBundles(

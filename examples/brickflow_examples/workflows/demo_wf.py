@@ -37,6 +37,7 @@ from brickflow_plugins import (
 
 wf = Workflow(
     "brickflow-demo",
+    description="Demo workflow showcasing brickflow features including tasks, notifications, and integrations",
     # replace <all-purpose-cluster-id> with your cluster id
     default_cluster=Cluster.from_existing_cluster("<all-purpose-cluster-id>"),
     # Optional parameters below
@@ -211,6 +212,8 @@ def lending_data_il_transform():
         lending_data_ca_transform,
         lending_data_il_transform,
     ]
+    # Alternative using pattern matching:
+    # depends_on="lending_data_*_transform"
 )
 def lending_data_serve():
     ctx.spark.sql(

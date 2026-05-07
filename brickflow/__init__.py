@@ -88,6 +88,8 @@ class BrickflowEnvVars(Enum):
     BRICKFLOW_USE_PROJECT_NAME = "BRICKFLOW_USE_PROJECT_NAME"  # for projects which injects project name to cli context
     BRICKFLOW_PROJECT_PARAMS = "BRICKFLOW_PROJECT_PARAMS"
     BRICKFLOW_PROJECT_TAGS = "BRICKFLOW_PROJECT_TAGS"
+    BRICKFLOW_INJECT_TASKS_CONFIG = "BRICKFLOW_INJECT_TASKS_CONFIG"
+    BRICKFLOW_INJECT_TASKS_DIR = "BRICKFLOW_INJECT_TASKS_DIR"
 
 
 def env_chain(env_var: str, dbx_get_param: str, default: Optional[str] = None) -> str:
