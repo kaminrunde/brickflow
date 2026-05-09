@@ -966,6 +966,7 @@ class Task:
     health: Optional[List[JobsTasksHealthRules]] = None
     if_else_outcome: Optional[Dict[Union[str, str], str]] = None
     for_each_task_conf: Optional[JobsTasksForEachTaskConfigs] = None
+    injected_notebook_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.is_valid_task_signature()
@@ -1316,13 +1317,15 @@ def get_brickflow_libraries(enable_plugins: bool = False) -> List[TaskLibrary]:
             f"brickflows @ git+https://github.com/kaminrunde/brickflow@develop"
         )
 
+    # IMPORTANT: Make sure that library versions in this function are aligned with the versions
+    # from poetry.lock / pyproject.toml. This set of libraries is also validated through tests/test_plugins.py
     if settings.brickflow_enable_plugins is True or enable_plugins is True:
         return [
             bf_lib,
-            PypiTaskLibrary("apache-airflow==2.7.3"),
-            PypiTaskLibrary("snowflake==0.6.0"),
+            PypiTaskLibrary("apache-airflow==2.10.5"),
+            PypiTaskLibrary("snowflake==1.5.1"),
             PypiTaskLibrary("tableauserverclient==0.25"),
-            PypiTaskLibrary("boxsdk==3.9.2"),
+            PypiTaskLibrary("boxsdk==3.13.0"),
             PypiTaskLibrary("cerberus-python-client==2.5.4"),
         ]
     else:

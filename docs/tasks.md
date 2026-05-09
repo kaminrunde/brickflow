@@ -71,6 +71,65 @@ def end():
 5. Create dependency on multiple tasks using list and tasks are passed as string. "custom_z_gold" is the task name that
    is explicitly defined - should not use "z_gold" which is a function name
 
+### Task dependency with pattern matching
+
+When you have many tasks with similar names, you can use glob patterns to specify dependencies instead of listing each task explicitly. Pattern matching is auto-detected when the dependency string contains wildcard characters (`*`, `?`, `[`, `]`).
+
+```python title="task_dependency_patterns"
+from brickflow import Workflow
+wf = Workflow(...)
+
+@wf.task
+def init_task():
+    pass
+
+@wf.task(depends_on=init_task)
+def transform_source_a():
+    pass
+
+@wf.task(depends_on=init_task)
+def transform_source_b():
+    pass
+
+@wf.task(depends_on=init_task)
+def transform_source_c():
+    pass
+
+@wf.task(depends_on="transform_*")  # (1)!
+def aggregate_all_transforms():
+    pass
+
+@wf.task(depends_on=[init_task, "transform_*"])  # (2)!
+def validate_and_aggregate():
+    pass
+```
+
+1. Use glob pattern `transform_*` to depend on all tasks starting with "transform_". This automatically matches `transform_source_a`, `transform_source_b`, and `transform_source_c`.
+2. Mix patterns with explicit dependencies. This task depends on `init_task` (callable reference) plus all tasks matching `transform_*` (pattern).
+
+#### Supported pattern syntax
+
+| Pattern | Meaning                  | Example       | Matches                              |
+|---------|--------------------------|---------------|--------------------------------------|
+| `*`     | Zero or more characters  | `transform_*` | `transform_data`, `transform_schema` |
+| `?`     | Exactly one character    | `task_?`      | `task_a`, `task_1`                   |
+| `[abc]` | One character from set   | `task_[abc]`  | `task_a`, `task_b`, `task_c`         |
+| `[0-9]` | One character from range | `task_[0-9]`  | `task_0` through `task_9`            |
+
+**Important notes:**
+
+- Pattern-dependent tasks should be defined **after** the tasks they match
+- If a pattern matches zero tasks, a clear error will be raised
+- Patterns are resolved at task definition time
+- A pattern will not match the task it's defined on (prevents circular dependencies)
+
+**Benefits of pattern matching:**
+
+- Automatic inclusion of new matching tasks
+- Less code to maintain
+- Clear, declarative intent
+- Reduces errors when adding new tasks
+
 ### Task parameters
 
 Task parameters can be defined as key value pairs in the function definition on which task is defined
@@ -271,6 +330,12 @@ def run_job_task_a():
 @wf.task(task_type=TaskType.RUN_JOB_TASK)
 def run_job_task_a():
     return RunJobTask(job_name="run_job_task")
+
+# reference the job in the same Brickflow project
+@wf.run_job_task
+def run_job_task_a():
+    from workflows.workflow_a import wf
+    return wf
 ```
 
 RunJobTask class can accept the following as inputs:<br />
@@ -810,31 +875,34 @@ Wait for a workflow to finish before kicking off the current workflow's tasks
 ```python title="workflow_dependency_sensor"
 from brickflow.context import ctx
 from brickflow_plugins import WorkflowDependencySensor
+from datetime import timedelta
 
 wf = Workflow(...)
 
 
 @wf.task
 def wait_on_workflow(*args):
-   api_token_key = ctx.dbutils.secrets.get("brickflow-demo-tobedeleted", "api_token_key")
+   api_token_key = ctx.dbutils.secrets.get("scope", "api_token_key")
    sensor = WorkflowDependencySensor(
       databricks_host="https://your_workspace_url.cloud.databricks.com",
       databricks_token=api_token_key,
-      dependency_job_id=job_id,
-      poke_interval=20,
-      timeout=60,
-      delta=timedelta(days=1)
+      dependency_job_name="upstream_job",
+      poke_interval_seconds=20,
+      timeout_seconds=60,
+      delta=timedelta(days=1),
    )
    sensor.execute()
 ```
 
 #### Workflow Task Dependency Sensor
 
-Wait for a specific task in a workflow to finish before kicking off the current workflow's tasks
+Wait for a specific task in a workflow to finish before kicking off the current workflow's tasks.
+Set `allow_skipped=True` if the upstream task may be conditionally skipped (`EXCLUDED`) and should be treated as successful.
 
-```python title="workflow_dependency_sensor"
+```python title="workflow_task_dependency_sensor"
 from brickflow.context import ctx
 from brickflow_plugins import WorkflowTaskDependencySensor
+from datetime import timedelta
 
 wf = Workflow(...)
 
@@ -845,11 +913,12 @@ def wait_on_workflow(*args):
    sensor = WorkflowTaskDependencySensor(
       databricks_host="https://your_workspace_url.cloud.databricks.com",
       databricks_token=api_token_key,
-      dependency_job_id=job_id,
+      dependency_job_name="my_job",
       dependency_task_name="foo",
-      poke_interval=20,
-      timeout=60,
-      delta=timedelta(days=1)
+      poke_interval_seconds=20,
+      timeout_seconds=60,
+      delta=timedelta(days=1),
+      allow_skipped=True,  # Optional (default: False)
    )
    sensor.execute()
 ```

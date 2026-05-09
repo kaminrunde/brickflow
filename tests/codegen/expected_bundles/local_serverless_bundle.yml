@@ -13,7 +13,6 @@
               "client": "1"
               "dependencies":
               - "pytz==2024.2"
-          "health": null
           "job_clusters": []
           "max_concurrent_runs": 1.0
           "name": "test_user_brickflow-serverless-demo"
@@ -21,7 +20,7 @@
           "parameters": null
           "permissions": null
           "schedule":
-            "pause_status": "UNPAUSED"
+            "pause_status": "PAUSED"
             "quartz_cron_expression": "0 0/20 0 ? * * *"
             "timezone_id": "UTC"
           "tags":

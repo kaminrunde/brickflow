@@ -1,6 +1,8 @@
 import abc
+import fnmatch
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
@@ -119,6 +121,7 @@ class Trigger(JobsTrigger):
 class Workflow:
     # name should be immutable and not modified after being set
     _name: str
+    description: Optional[str] = None
     schedule_quartz_expression: Optional[str] = None
     schedule_continuous: Optional[JobsContinuous] = None
     timezone: str = "UTC"
@@ -150,9 +153,24 @@ class Workflow:
     parameters: Optional[List[JobsParameters]] = None
     # environments should be defined for serverless workloads
     environments: Optional[List[JobsEnvironments]] = None
+    # enabled by databricks asset bundles by default if set to None
+    # Look at https://github.com/databricks/cli/pull/1385
+    queue: Optional[bool] = None
 
     def __post_init__(self) -> None:
         self.graph.add_node(ROOT_NODE)
+
+        # Set schedule_pause_status to PAUSED by default for non-prod environments
+        env = os.getenv(BrickflowEnvVars.BRICKFLOW_ENV.value, "local").lower()
+        envs_to_pause = ["local", "dev", "test"]
+
+        if env in envs_to_pause and self.schedule_pause_status == "UNPAUSED":
+            logging.info(
+                "Setting schedule_pause_status to PAUSED as default for %s environment",
+                env,
+            )
+            self.schedule_pause_status = "PAUSED"
+
         if self.default_cluster is None and self.clusters == []:
             logging.info(
                 "Default cluster details are not provided, switching to serverless compute."
@@ -364,6 +382,60 @@ class Workflow:
             else:
                 self.graph.add_edge(t.__name__, task_id)
 
+    def _resolve_task_patterns(
+        self,
+        depends_on: Optional[Union[Callable, str, List[Union[Callable, str]]]],
+        current_task_id: Optional[str] = None,
+    ) -> List[Union[Callable, str]]:
+        """
+        Resolve glob patterns in depends_on to actual task names.
+
+        Patterns are auto-detected by the presence of glob wildcards: *, ?, [, ]
+        When detected, use Python's fnmatch module to match against existing task names.
+
+        Args:
+            depends_on: Task dependencies - can be Callable, str, or list of either
+            current_task_id: ID of current task (to prevent self-reference)
+
+        Returns:
+            List of resolved dependencies (patterns expanded to task names)
+
+        Raises:
+            ValueError: If a pattern matches zero tasks
+        """
+        if depends_on is None:
+            return []
+
+        # Normalize to list
+        depends_on_list = depends_on if isinstance(depends_on, list) else [depends_on]
+        resolved_dependencies: List[Union[Callable, str]] = []
+
+        for dep in depends_on_list:
+            # Check if this is a pattern (string with wildcards)
+            if isinstance(dep, str) and any(c in dep for c in ["*", "?", "[", "]"]):
+                # This is a pattern - resolve it to matching task names
+                matches = [
+                    task_name
+                    for task_name in self.tasks
+                    if fnmatch.fnmatch(task_name, dep) and task_name != current_task_id
+                ]
+
+                if not matches:
+                    raise ValueError(
+                        f"Pattern '{dep}' did not match any tasks. "
+                        f"Available tasks: {sorted(self.tasks.keys())}"
+                    )
+
+                logging.info(
+                    "Pattern '%s' resolved to %s tasks: %s", dep, len(matches), matches
+                )
+                resolved_dependencies.extend(matches)
+            else:
+                # Regular dependency (Callable or exact string)
+                resolved_dependencies.append(dep)
+
+        return resolved_dependencies
+
     def _add_task(
         self,
         f: Callable,
@@ -379,6 +451,7 @@ class Workflow:
         ensure_brickflow_plugins: bool = False,
         if_else_outcome: Optional[Dict[Union[str, str], str]] = None,
         for_each_task_conf: Optional[JobsTasksForEachTaskConfigs] = None,
+        injected_notebook_path: Optional[str] = None,
     ) -> None:
         if self.task_exists(task_id):
             raise TaskAlreadyExistsError(
@@ -396,11 +469,10 @@ class Workflow:
             )
 
         _libraries = libraries or [] + self.libraries
-        _depends_on = (
-            [depends_on]
-            if isinstance(depends_on, str) or callable(depends_on)
-            else depends_on
-        )
+
+        # Resolve any glob patterns in dependencies
+        resolved_deps = self._resolve_task_patterns(depends_on, task_id)
+        _depends_on = resolved_deps if resolved_deps else None
 
         if self.enable_plugins is not None:
             ensure_plugins = self.enable_plugins
@@ -415,7 +487,7 @@ class Workflow:
         # enforce notebook type execution and replacing the original callable function with the RunJobInRemoteWorkspace
         if task_type == TaskType.RUN_JOB_TASK:
             func = f()
-            if func.host:
+            if hasattr(func, "host") and func.host:
                 from brickflow_plugins.databricks.run_job import RunJobInRemoteWorkspace
 
                 task_type = TaskType.BRICKFLOW_TASK
@@ -446,6 +518,7 @@ class Workflow:
             ensure_brickflow_plugins=ensure_plugins,
             if_else_outcome=if_else_outcome,
             for_each_task_conf=for_each_task_conf,
+            injected_notebook_path=injected_notebook_path,
         )
 
         # attempt to create task object before adding to graph

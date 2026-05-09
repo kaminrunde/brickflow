@@ -10,7 +10,7 @@ from dataclasses import field, dataclass
 from enum import Enum
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, Optional, List, Any, Type
+from typing import Dict, Optional, List, Any, Type, Union, Callable, cast
 
 from decouple import config
 
@@ -23,12 +23,15 @@ from brickflow.cli import BrickflowDeployMode
 from brickflow.codegen import CodegenInterface
 from brickflow.codegen.databricks_bundle import DatabricksBundleCodegen
 from brickflow.context import ctx, BrickflowInternalVariables
-from brickflow.engine import get_current_commit
+from brickflow.engine import get_current_commit, ROOT_NODE
 from brickflow.engine.task import (
     TaskLibrary,
     filter_bf_related_libraries,
     get_brickflow_libraries,
+    TaskType,
+    PypiTaskLibrary,
 )
+from brickflow.engine.compute import Cluster
 from brickflow.engine.utils import wraps_keyerror
 from brickflow.engine.workflow import Workflow
 
@@ -108,6 +111,10 @@ class _Project:
             raise WorkflowAlreadyExistsError(
                 f"Workflow with name: {workflow.name} already exists!"
             )
+
+        # Inject tasks from YAML config if specified
+        self._inject_tasks_from_yaml(workflow)
+
         self.workflows[workflow.name] = workflow
 
     def workflow_exists(self, workflow: Workflow) -> bool:
@@ -116,6 +123,432 @@ class _Project:
     @wraps_keyerror(WorkflowNotFoundError, "Unable to find workflow: ")
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
         return self.workflows[workflow_id]
+
+    def _get_workflow_specific_config_path(self, workflow_name: str) -> Optional[str]:
+        """
+        Find workflow-specific config file.
+
+        Checks BRICKFLOW_INJECT_TASKS_DIR/<workflow_name>.yaml
+
+        Returns: Path to workflow-specific config file, or None if not found
+        """
+        inject_dir = os.environ.get(BrickflowEnvVars.BRICKFLOW_INJECT_TASKS_DIR.value)
+        if not inject_dir:
+            return None
+
+        specific_path = Path(inject_dir) / f"{workflow_name}.yaml"
+        if specific_path.exists():
+            return str(specific_path)
+
+        return None
+
+    def _inject_tasks_from_yaml(self, workflow: Workflow) -> None:
+        """
+        Inject tasks into workflow based on YAML configuration.
+
+        This is called during add_workflow() to inject tasks before the workflow
+        is registered in the project.
+
+        Loads tasks from two sources:
+        1. Global config (BRICKFLOW_INJECT_TASKS_CONFIG) - applies to ALL workflows
+        2. Workflow-specific config (BRICKFLOW_INJECT_TASKS_DIR/<workflow_name>.yaml) - applies only to this workflow
+        """
+        # Load global config first (applies to all workflows)
+        global_config_path = os.environ.get(
+            BrickflowEnvVars.BRICKFLOW_INJECT_TASKS_CONFIG.value
+        )
+        if global_config_path:
+            _ilog.info("Loading global task injection config: %s", global_config_path)
+            self._inject_tasks_from_config_file(
+                workflow, global_config_path, is_global=True
+            )
+
+        # Load workflow-specific config (only for this workflow)
+        specific_config_path = self._get_workflow_specific_config_path(workflow.name)
+        if specific_config_path:
+            _ilog.info(
+                "Loading workflow-specific task injection config for '%s': %s",
+                workflow.name,
+                specific_config_path,
+            )
+            self._inject_tasks_from_config_file(
+                workflow, specific_config_path, is_global=False
+            )
+
+    def _resolve_task_config_parameters(
+        self, task_config: Dict[str, Any], template_context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Resolve Jinja2 template variables in task_config.
+
+        Works recursively through strings, lists, and dicts to resolve
+        template variables like {{catalog}}, {{schema}}, etc.
+
+        Args:
+            task_config: The task configuration dictionary
+            template_context: The template context with variable values
+
+        Returns:
+            Resolved task configuration
+        """
+        from jinja2 import Template
+
+        def resolve_value(value: Any) -> Any:
+            """Recursively resolve template variables in any value type."""
+            if isinstance(value, str) and "{{" in value:
+                return Template(value).render(**template_context)
+            elif isinstance(value, list):
+                return [resolve_value(item) for item in value]
+            elif isinstance(value, dict):
+                return {k: resolve_value(v) for k, v in value.items()}
+            else:
+                return value
+
+        return {key: resolve_value(value) for key, value in task_config.items()}
+
+    def _create_native_task_function(
+        self, task_type: TaskType, task_config: Dict[str, Any]
+    ) -> Callable:
+        """
+        Create a function that returns the appropriate native task object.
+
+        This is a factory pattern for native Databricks task types.
+        The function returned will be called during bundle generation to
+        produce the task object (PythonWheelTask, NotebookTask, etc.).
+
+        Args:
+            task_type: The Databricks task type (:class:`TaskType`)
+            task_config: The resolved task configuration
+
+        Returns:
+            A callable that returns the appropriate task object
+
+        Raises:
+            ValueError: If task_type is not supported
+        """
+        from brickflow.engine.task import (
+            NotebookTask,
+            PythonWheelTask,
+            SparkJarTask,
+            SparkPythonTask,
+            SqlTask,
+            RunJobTask,
+            IfElseConditionTask,
+        )
+
+        task_class_map: Dict[TaskType, Type[Any]] = {
+            TaskType.NOTEBOOK_TASK: NotebookTask,
+            TaskType.PYTHON_WHEEL_TASK: PythonWheelTask,
+            TaskType.SPARK_JAR_TASK: SparkJarTask,
+            TaskType.SPARK_PYTHON_TASK: SparkPythonTask,
+            TaskType.SQL: SqlTask,
+            TaskType.RUN_JOB_TASK: RunJobTask,
+            TaskType.IF_ELSE_CONDITION_TASK: IfElseConditionTask,
+        }
+
+        task_class = task_class_map.get(task_type)
+        if not task_class:
+            supported = [t.name for t in task_class_map]
+            raise ValueError(
+                f"Unsupported native task type: {task_type.name}. "
+                f"Supported types for injection: {supported} or use BRICKFLOW_TASK with template_file."
+            )
+
+        # Create function that returns task object
+        def native_task_func() -> Any:
+            return task_class(**task_config)
+
+        return native_task_func
+
+    def _inject_tasks_from_config_file(
+        self, workflow: Workflow, config_path: str, is_global: bool
+    ) -> None:
+        """
+        Inject tasks from a single config file into the workflow.
+
+        Args:
+            workflow: The workflow to inject tasks into
+            config_path: Path to the config file
+            is_global: True if this is a global config (applies to all workflows)
+        """
+        try:
+            from brickflow.engine.task_injection_config import TaskInjectionConfig
+            from brickflow.engine.task_executor import GenericTaskExecutor
+
+            # Load configuration
+            config_obj = TaskInjectionConfig.from_yaml(config_path)
+
+            if not config_obj.global_config.enabled:
+                config_type = "global" if is_global else "workflow-specific"
+                _ilog.info(
+                    "Task injection is disabled in %s config: %s",
+                    config_type,
+                    config_path,
+                )
+                return
+
+            # Inject each enabled task
+            for task_def in config_obj.tasks:
+                if not task_def.enabled:
+                    _ilog.info("Skipping disabled task: %s", task_def.task_name)
+                    continue
+
+                _ilog.info(
+                    "Injecting task '%s' into workflow '%s'",
+                    task_def.task_name,
+                    workflow.name,
+                )
+
+                # For "all_tasks" strategy, capture existing root tasks before injection
+                existing_root_tasks = []
+                if task_def.depends_on_strategy == "all_tasks":
+                    existing_root_tasks = self._find_root_tasks(workflow)
+                    _ilog.info(
+                        "Found %d root tasks to update: %s",
+                        len(existing_root_tasks),
+                        existing_root_tasks,
+                    )
+
+                # Create task function based on task type and configuration
+                injected_notebook_path = None
+
+                if task_def.task_type == TaskType.BRICKFLOW_TASK:
+                    # APPROACH 1: Direct notebook generation
+                    _ilog.info(
+                        "Generating notebook for injected task '%s'",
+                        task_def.task_name,
+                    )
+
+                    executor = GenericTaskExecutor(task_def)
+
+                    # Render template directly to notebook file
+                    injected_notebook_path = executor.render_to_notebook()
+
+                    _ilog.info(
+                        "Generated injected notebook: %s",
+                        injected_notebook_path,
+                    )
+
+                    def task_func() -> None:
+                        pass
+
+                elif (
+                    task_def.task_type != TaskType.BRICKFLOW_TASK
+                    and task_def.task_config
+                ):
+                    # APPROACH 2: Native task type (new)
+                    _ilog.info(
+                        "Creating native %s '%s'",
+                        task_def.task_type,
+                        task_def.task_name,
+                    )
+
+                    # Resolve template variables in task_config
+                    _ilog.debug(
+                        "Resolving task_config %s with context %s",
+                        task_def.task_config,
+                        task_def.template_context,
+                    )
+                    resolved_task_config = self._resolve_task_config_parameters(
+                        task_def.task_config,
+                        task_def.template_context,
+                    )
+                    _ilog.debug("Resolved task_config: %s", resolved_task_config)
+
+                    # Create function that returns native task object
+                    task_func = self._create_native_task_function(
+                        task_def.task_type,
+                        resolved_task_config,
+                    )
+
+                    _ilog.info(
+                        "Injected %s: %s with config %s",
+                        task_def.task_type,
+                        task_def.task_name,
+                        resolved_task_config,
+                    )
+
+                elif (
+                    task_def.task_type != TaskType.BRICKFLOW_TASK
+                    and not task_def.task_config
+                ):
+                    raise ValueError(
+                        f"Task '{task_def.task_name}' has task_type='{task_def.task_type.name}' "
+                        f"but no task_config provided. Native task types require task_config."
+                    )
+
+                else:
+                    raise ValueError(
+                        f"Invalid configuration for task '{task_def.task_name}'. "
+                        f"Either provide template_file (for BRICKFLOW_TASK) or "
+                        f"task_config (for native task types)."
+                    )
+
+                # Build libraries list
+                task_libraries = self._build_task_libraries(
+                    task_def.libraries,
+                    config_obj.global_config.default_libraries,
+                )
+
+                # Determine dependencies based on strategy
+                depends_on = self._get_injection_dependencies(
+                    workflow, task_def.depends_on_strategy
+                )
+
+                # Get cluster configuration
+                cluster = None
+                if task_def.cluster:
+                    cluster = Cluster.from_existing_cluster(task_def.cluster)
+
+                # Inject the task into workflow
+                workflow._add_task(
+                    f=task_func,
+                    task_id=task_def.task_name,
+                    depends_on=cast(
+                        Optional[Union[Callable, str, List[Union[Callable, str]]]],
+                        depends_on,
+                    ),
+                    task_type=task_def.task_type,
+                    libraries=task_libraries,
+                    cluster=cluster,
+                    injected_notebook_path=injected_notebook_path,
+                )
+
+                # For "all_tasks" strategy, make all root tasks depend on injected task
+                if task_def.depends_on_strategy == "all_tasks":
+                    self._update_root_tasks_dependencies(
+                        workflow, existing_root_tasks, task_def.task_name
+                    )
+
+                _ilog.info("Successfully injected task: %s", task_def.task_name)
+
+        except FileNotFoundError:
+            _ilog.warning("Task injection config file not found: %s", config_path)
+        except Exception as e:
+            _ilog.error(
+                "Failed to inject tasks from YAML config '%s': %s",
+                config_path,
+                e,
+                exc_info=True,
+            )
+            raise
+            # Don't fail deployment on injection errors
+
+    def _build_task_libraries(
+        self,
+        task_libraries: List[str],
+        global_libraries: List[str],
+    ) -> List[TaskLibrary]:
+        """
+        Build the complete list of libraries for an injected task.
+
+        Combines:
+        - Global default libraries
+        - Task-specific libraries
+
+        Note: Artifacts are handled separately in GenericTaskExecutor.create_task_function()
+        """
+        all_libraries: List[TaskLibrary] = []
+
+        # Add global default libraries
+        for lib in global_libraries:
+            all_libraries.append(PypiTaskLibrary(package=lib))
+
+        # Add task-specific libraries
+        for lib in task_libraries:
+            all_libraries.append(PypiTaskLibrary(package=lib))
+
+        # Note: If artifact should be installed as library, it's handled
+        # via artifact.install_as_library in the task execution phase
+
+        return all_libraries
+
+    def _get_injection_dependencies(
+        self, workflow: Workflow, strategy: str
+    ) -> Optional[List[str]]:
+        """
+        Determine task dependencies based on injection strategy.
+
+        Strategies:
+        - "leaf_nodes": Inject after all leaf nodes (tasks with no downstream deps)
+        - "all_tasks": All tasks depend on this (task runs first)
+        - "specific_tasks": Comma-separated list of task names
+        """
+        if strategy == "all_tasks":
+            # This task runs first, so no dependencies
+            return None
+
+        elif strategy == "leaf_nodes":
+            # Find all leaf nodes (tasks with no downstream dependencies)
+            leaf_nodes = self._find_leaf_nodes(workflow)
+            return leaf_nodes if leaf_nodes else None
+
+        elif strategy.startswith("specific_tasks:"):
+            # Parse specific task names
+            task_names = strategy.replace("specific_tasks:", "").split(",")
+            return [name.strip() for name in task_names if name.strip()]
+
+        else:
+            # Default to leaf_nodes
+            _ilog.warning(
+                "Unknown injection strategy '%s', defaulting to leaf_nodes", strategy
+            )
+            return self._find_leaf_nodes(workflow)
+
+    def _find_leaf_nodes(self, workflow: Workflow) -> List[str]:
+        """
+        Find all leaf nodes in the workflow DAG.
+
+        Leaf nodes are tasks that have no downstream dependencies
+        (no other tasks depend on them).
+        """
+        leaf_nodes = []
+
+        for task_name in workflow.tasks.keys():
+            # Check if this task has any successors in the graph
+            successors = list(workflow.graph.successors(task_name))
+            if not successors:
+                leaf_nodes.append(task_name)
+
+        return leaf_nodes
+
+    def _find_root_tasks(self, workflow: Workflow) -> List[str]:
+        """
+        Find all root tasks in the workflow DAG.
+
+        Root tasks are tasks that have no upstream dependencies
+        (they don't depend on other tasks, only on the root node).
+        """
+        root_tasks = []
+
+        for task_name in workflow.tasks.keys():
+            # Get predecessors (dependencies) for this task
+            predecessors = list(workflow.graph.predecessors(task_name))
+            # Filter out the ROOT_NODE as it's just a marker
+            real_predecessors = [p for p in predecessors if p != ROOT_NODE]
+
+            # If no real predecessors, this is a root task
+            if not real_predecessors:
+                root_tasks.append(task_name)
+
+        return root_tasks
+
+    def _update_root_tasks_dependencies(
+        self, workflow: Workflow, root_tasks: List[str], injected_task_name: str
+    ) -> None:
+        """
+        Update root tasks to depend on the injected task.
+
+        This is used for the "all_tasks" strategy to ensure the injected
+        task runs first and all other tasks depend on it.
+        """
+        for root_task in root_tasks:
+            # Add edge from injected task to root task
+            # This makes root_task depend on injected_task_name
+            workflow.graph.add_edge(injected_task_name, root_task)
+            _ilog.info(
+                "Updated task '%s' to depend on '%s'", root_task, injected_task_name
+            )
 
 
 class Stage(Enum):
